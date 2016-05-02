@@ -62,6 +62,9 @@ def setup_parser():
     report.add_argument(
         '--raw', type=argparse.FileType('wb'),
         help="Store raw json of collected records to given file path")
+    report.add_argument(
+        '-x', '--excel', default=None,
+        help="Write report to an Excel workbook")
 
     identify = subs.add_parser("identify")
     identify.set_defaults(command=commands.identify)

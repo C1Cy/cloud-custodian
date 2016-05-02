@@ -50,6 +50,7 @@ from concurrent.futures import as_completed
 from cStringIO import StringIO
 import csv
 from datetime import datetime
+from openpyxl import Workbook
 import gzip
 import json
 import logging
@@ -64,14 +65,15 @@ from c7n.utils import local_session, dumps
 log = logging.getLogger('custodian.reports')
 
 
-def report(policy, start_date, output_fh, raw_output_fh=None, filters=None):
+def report(policy, start_date, output_fh, raw_output_fh=None, filters=None, write=True):
     """Format a policy's extant records into a report."""
     formatter = RECORD_TYPE_FORMATTERS.get(policy.resource_type)
 
     if formatter is None:
-        raise ValueError(
-            "No formatter for resource type %s, valid: %s" % (
-                policy.resource_type, ", ".join(RECORD_TYPE_FORMATTERS)))
+        return
+        # raise ValueError(
+        #     "No formatter for resource type %s, valid: %s" % (
+        #         policy.resource_type, ", ".join(RECORD_TYPE_FORMATTERS)))
 
     if policy.ctx.output_path.startswith('s3'):
         records = record_set(
@@ -84,13 +86,34 @@ def report(policy, start_date, output_fh, raw_output_fh=None, filters=None):
 
     rows = formatter.to_csv(records)
 
-    writer = csv.writer(output_fh, formatter.headers())
-    writer.writerow(formatter.headers())
-    writer.writerows(rows)
+    if write:
+        writer = csv.writer(output_fh, formatter.headers())
+        writer.writerow(formatter.headers())
+        writer.writerows(rows)
 
-    if raw_output_fh is not None:
-        dumps(records, raw_output_fh, indent=2)
+        if raw_output_fh is not None:
+            dumps(records, raw_output_fh, indent=2)
 
+    return [formatter.headers()] + rows
+
+def report_all(policies, start_date, wb_name, raw_output_fh=None, filters=None):
+    """Formats a collection of policies' extant records into a report."""
+
+    wb = Workbook()
+
+    for policy in policies:
+        rows = report(policy, start_date, None, raw_output_fh=None, filters=None, write=False)
+
+        if rows:
+            ws = wb.create_sheet()
+            ws.title = policy.name[:31]
+
+            for row_idx in range(0, len(rows)):
+                for col_idx in range(0, len(rows[row_idx])):
+                    cell = ws.cell(row=row_idx+1, column=col_idx+1)
+                    cell.value = rows[row_idx][col_idx]
+
+    wb.save(wb_name)
 
 class Formatter(object):
     def __init__(self, id_field, headers):
@@ -124,6 +147,8 @@ class Formatter(object):
         return uniq
 
     def to_csv(self, records, reverse=True):
+        if not records:
+            return []
         filtered = filter(self.filter_record, records)
         log.debug("Filtered from %d to %d" % (len(records), len(filtered)))
         if 'CustodianDate' in records[0]:

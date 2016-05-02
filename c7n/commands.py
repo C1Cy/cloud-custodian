@@ -19,6 +19,7 @@ import time
 
 from c7n.credentials import SessionFactory
 from c7n.reports import report as do_report
+from c7n.reports import report_all
 from c7n import mu, schema
 
 
@@ -59,15 +60,21 @@ def run(options, policy_collection):
 
 def report(options, policy_collection):
     policies = policy_collection.policies(options.policies)
-    assert len(policies) == 1, "Only one policy report at a time"
-    policy = policies.pop()
     
     d = datetime.now()
     delta = timedelta(days=options.days)
     begin_date = d - delta
-    do_report(
-        policy, begin_date, sys.stdout,
-        raw_output_fh=options.raw)
+    
+    if options.excel:
+        report_all(
+            policies, begin_date, options.excel,
+            raw_output_fh=options.raw)        
+    else:
+        assert len(policies) == 1, "Only one policy report at a time"
+        policy = policies.pop()
+        do_report(
+            policy, begin_date, sys.stdout,
+            raw_output_fh=options.raw)
 
 
 def logs(options, policy_collection):
