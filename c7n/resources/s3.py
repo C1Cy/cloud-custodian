@@ -41,6 +41,7 @@ from botocore.client import Config
 from botocore.exceptions import ClientError
 from concurrent.futures import as_completed
 
+import functools
 import json
 import itertools
 import logging
@@ -87,6 +88,12 @@ class S3(ResourceManager):
         return results
 
     def resources(self):
+        if self._cache.load():
+            buckets = self._cache.get({'resource': 's3'})
+            if buckets is not None:
+                log.info("Using cached s3 buckets")
+                return self.filter_resources(buckets)
+            
         c = self.session_factory().client('s3')
         log.debug('Retrieving buckets')
         response = c.list_buckets()
@@ -98,7 +105,24 @@ class S3(ResourceManager):
                 assemble_bucket,
                 zip(itertools.repeat(self.session_factory), buckets))
             results = filter(None, results)
+
+        self._cache.save({'resource': 's3'}, results)
         return self.filter_resources(results)
+
+
+S3_AUGMENT_TABLE = (
+        ('get_bucket_location', 'Location', None, None),
+        ('get_bucket_tagging', 'Tags', [], 'TagSet'),
+        ('get_bucket_policy',  'Policy', None, None),
+        ('get_bucket_acl', 'Acl', None, None),
+        ('get_bucket_replication', 'Replication', None, None),
+        ('get_bucket_versioning', 'Versioning', None, None),
+        ('get_bucket_website', 'Website', None, None),
+        ('get_bucket_logging', 'Logging', None, 'LoggingEnabled')
+#        ('get_bucket_lifecycle', 'Lifecycle', None, None),
+#        ('get_bucket_cors', 'Cors'),
+#        ('get_bucket_notification_configuration', 'Notification')
+)
 
 
 def assemble_bucket(item):
@@ -109,28 +133,15 @@ def assemble_bucket(item):
     s = factory()
     c = s.client('s3')
 
-    methods = [
-        ('get_bucket_location', 'Location', None, None),
-        ('get_bucket_tagging', 'Tags', [], 'TagSet'),
-        ('get_bucket_policy',  'Policy', None, None),
-        ('get_bucket_acl', 'Acl', None, None),
-        ('get_bucket_replication', 'Replication', None, None),
-        ('get_bucket_versioning', 'Versioning', None, None),
-        ('get_bucket_website', 'Website', None, None)
-#        ('get_bucket_lifecycle', 'Lifecycle', None, None),
-#        ('get_bucket_cors', 'Cors'),
-#        ('get_bucket_notification_configuration', 'Notification')
-    ]
-
-    # Bucket Location, Current Client Location, Default Location
+     # Bucket Location, Current Client Location, Default Location
     b_location = c_location = location = "us-east-1"
-
+    methods = list(S3_AUGMENT_TABLE)
     for m, k, default, select in methods:
         try:
             method = getattr(c, m)
             v = method(Bucket=b['Name'])
             v.pop('ResponseMetadata')
-            if select is not None:
+            if select is not None and select in v:
                 v = v[select]
         except ClientError, e:
             code =  e.response['Error']['Code']
@@ -214,52 +225,6 @@ class BucketActionBase(BaseAction):
         return self.permissions
 
 
-@actions.register('encrypted-prefix')
-class EncryptedPrefix(BucketActionBase):
-
-    permissions = ("s3:GetObject", "s3:PutObject")
-
-    def process(self, buckets):
-        prefix = self.data.get('prefix')
-        with self.executor_factory(max_workers=5) as w:
-            results = w.map(self.process_bucket, buckets)
-            results = filter(None, list(results))
-            return results
-
-    def process_bucket(self, b):
-        s3 = bucket_client(self.manager.session_factory(), b)
-        k = self.data.get('prefix', 'AWSLogs')
-
-        create = True
-        try:
-            data = s3.head_object(Bucket=b['Name'], Key=k)
-            create = False
-            if 'ServerSideEncryption' in data:
-                return None
-        except ClientError, e:
-            if e.response['Error']['Code'] != '404':
-                raise
-
-        crypto_method = self.data.get('crypto', 'AES256')
-        if create:
-            content = "Path Prefix Object For Sub Path Encryption"
-            s3.put_object(
-                Bucket=b['Name'],
-                Key=k,
-                ACL="bucket-owner-full-control",
-                Body=content,
-                ServerSideEncryption=crypto_method)
-            return {'Bucket': b['Name'], 'Prefix': k, 'State': 'Created'}
-
-        # Note on copy we lose individual key acl grants
-        s3.copy_object(
-            Bucket=b['Name'], Key=k,
-            CopySource="/%s/%s" % (b, k),
-            MetadataDirective='COPY',
-            ServerSideEncryption=crypto_method)
-        return {'Bucket': b['Name'], 'Prefix': k, 'State': 'Updated'}
-
-
 @filters.register('missing-policy-statement')
 class MissingPolicyStatementFilter(Filter):
     """Find buckets missing a set of named policy statements."""
@@ -285,7 +250,7 @@ class MissingPolicyStatementFilter(Filter):
         statements = p.get('Statement', [])
 
         for s in list(statements):
-            if s['StatementId'] in required:
+            if s.get('StatementId') in required:
                 required.remove(s['StatementId'])
         if not required:
             return None
@@ -322,7 +287,7 @@ class EncryptionRequiredPolicy(BucketActionBase):
         p = b['Policy']
         if p is None:
             log.info("No policy found, creating new")
-            p = {'Version': "2012-10-17", "Statements": []}
+            p = {'Version': "2012-10-17", "Statement": []}
         else:
             p = json.loads(p['Policy'])
 
@@ -342,11 +307,11 @@ class EncryptionRequiredPolicy(BucketActionBase):
              'Effect': 'Deny',
              'Principal': '*',
              'Action': 's3:PutObject',
-             "Resource":"arn:aws:s3:::%s/*" % b['Name'],
-             "Condition":{
+             "Resource": "arn:aws:s3:::%s/*" % b['Name'],
+             "Condition": {
                  # AWS Managed Keys or KMS keys, note policy language
                  # does not support custom kms (todo add issue)
-                 "StringNotEquals":{
+                 "StringNotEquals": {
                      "s3:x-amz-server-side-encryption": ["AES256", "aws:kms"]}}
              })
         p['Statement'] = statements
@@ -419,6 +384,10 @@ class ScanBucket(BucketActionBase):
             }
         }
 
+    def __init__(self, data, manager=None):
+        super(ScanBucket, self).__init__(data, manager)
+        self.denied_buckets = []
+
     def get_bucket_style(self, b):
         return (
             b.get('Versioning', {'Status': ''}).get('Status') == 'Enabled'
@@ -436,6 +405,12 @@ class ScanBucket(BucketActionBase):
         with self.executor_factory(max_workers=3) as w:
             results.extend(
                 f for f in w.map(self, buckets) if f)
+        if self.denied_buckets:
+            with open(
+                    os.path.join(
+                        self.manager.log_dir, 'denied.json'), 'w') as fh:
+                json.dump(fh, indent=2)
+            self.denied_buckets = []
         return results
 
     def process_bucket(self, b):
@@ -459,6 +434,11 @@ class ScanBucket(BucketActionBase):
                         log.warning(
                             "Bucket:%s removed while scanning" % b['Name'])
                         return
+                    if e.response['Error']['Code'] == 'AccessDenied':
+                        log.warning(
+                            "Access Denied Bucket:%s while scanning" % b['Name'])
+                        self.denied_buckets.append(b['Name'])
+                        return
                     log.exception(
                         "Error processing bucket:%s paginator:%s" % (
                             b['Name'], p))
@@ -473,6 +453,9 @@ class ScanBucket(BucketActionBase):
 
             # Empty bucket check
             if not content_key in key_set and not key_set['IsTruncated']:
+                # annotate bucket
+                b['KeyScanCount'] = count
+                b['KeyRemediated'] = key_log.count
                 return {'Bucket': b['Name'],
                         'Remediated': key_log.count,
                         'Count': count}
@@ -645,6 +628,115 @@ def restore_complete(restore):
     return 'false' in ongoing
 
 
+@filters.register('is-log-target')
+class LogTarget(Filter):
+    """Filter and return buckets are log destinations.
+
+    Not suitable for use in lambda on large accounts, This is a api
+    heavy process to detect scan all possible log sources.
+
+    Sources:
+      - elb (Access Log)
+      - s3 (Access Log)
+      - cfn (Template writes)
+      - cloudtrail
+    """
+
+    schema = type_schema('is-log-target')
+    executor_factory = executor.MainThreadExecutor
+    
+    def process(self, buckets, event=None):
+        log_buckets = set()
+        count = 0
+        for bucket, _ in self.get_elb_bucket_locations():
+            log_buckets.add(bucket)
+            count += 1
+        self.log.debug("Found %d elb log targets" % count)
+
+        count = 0
+        for bucket, _ in self.get_s3_bucket_locations(buckets):
+            count +=1
+            log_buckets.add(bucket)
+        self.log.debug('Found %d s3 log targets' % count)
+
+        for bucket, _ in self.get_cloud_trail_locations(buckets):
+            log_buckets.add(bucket)
+            
+        self.log.info("Found %d log targets for %d buckets" % (
+            len(log_buckets), len(buckets)))
+        return [b for b in buckets if b['Name'] in log_buckets]
+
+    @staticmethod
+    def get_s3_bucket_locations(buckets):
+        """return (bucket_name, prefix) for all s3 logging targets"""
+        for b in buckets:
+            if b['Logging']:
+                yield (b['Logging']['TargetBucket'],
+                       b['Logging']['TargetPrefix'])
+            if b['Name'].startswith('cf-templates-'):
+                yield (b['Name'], '')
+
+    def get_cloud_trail_locations(self, buckets):
+        session = local_session(self.manager.session_factory)
+        client = session.client('cloudtrail')
+        names = set([b['Name'] for b in buckets])
+        for t in client.describe_trails().get('trailList', ()):
+            if t.get('S3BucketName') in names:
+                yield (t['S3BucketName'], t['S3KeyPrefix'])
+
+    def get_elb_bucket_locations(self):
+        session = local_session(self.manager.session_factory)
+        client = session.client('elb')
+
+        # Try to use the cache if it exists
+        elbs = self.manager._cache.get(
+            {'region': self.manager.config.region, 'resource': 'elb'})
+
+        # Sigh, post query refactor reuse, we can't save our cache here
+        # as that resource manager does extra lookups on tags. Not
+        # worth paginating, since with cache usage we have full set in
+        # mem.
+        if elbs is None:
+            p = client.get_paginator('describe_load_balancers')
+            results = p.paginate()
+            elbs = results.build_full_result().get(
+                'LoadBalancerDescriptions', ())
+
+        get_elb_attrs = functools.partial(
+            _query_elb_attrs, self.manager.session_factory)
+        
+        with self.executor_factory(max_workers=2) as w:
+            futures = []
+            for elb_set in chunks(elbs, 100):
+                futures.append(w.submit(get_elb_attrs, elb_set))
+            for f in as_completed(futures):
+                if f.exception():
+                    log.error("Error while scanning elb log targets: %s" % (
+                        f.exception()))
+                    continue
+                for tgt in f.result():
+                    yield tgt
+                        
+
+def _query_elb_attrs(session_factory, elb_set):
+    session = local_session(session_factory)
+    client = session.client('elb')
+    log_targets = []
+    for e in elb_set:
+        try:
+            attrs = client.describe_load_balancer_attributes(
+                LoadBalancerName=e['LoadBalancerName'])
+            if 'AccessLog' in attrs and attrs['AccessLog']['Enabled']:
+                log_targets.append((
+                    attrs['AccessLog']['BucketName'],
+                    attrs['AccessLog']['S3BucketPrefix']))
+        except Exception as err:
+            log.warning(
+                "Could not retrieve load balancer %s: %s" % (
+                    e['LoadBalancerName'], err))
+    return log_targets
+        
+
 @actions.register('delete-global-grants')
 class DeleteGlobalGrants(BucketActionBase):
 
@@ -655,7 +747,7 @@ class DeleteGlobalGrants(BucketActionBase):
 
     def process(self, buckets):
         with self.executor_factory(max_workers=5) as w:
-            list(w.map(self.process_bucket, buckets))
+            return filter(None, list(w.map(self.process_bucket, buckets)))
 
     def process_bucket(self, b):
         grantees = self.data.get('grantees')
@@ -677,7 +769,7 @@ class DeleteGlobalGrants(BucketActionBase):
                 grantee['Type'] = 'CanonicalUser'
             if ('URI' in grantee and
                 grantee['URI'] in grantees and not
-                (grant['Permission'] == 'READ' and b['Website'])):
+                    (grant['Permission'] == 'READ' and b['Website'])):
                 # Remove this grantee.
                 pass
             else:
@@ -689,3 +781,4 @@ class DeleteGlobalGrants(BucketActionBase):
         c.put_bucket_acl(
             Bucket=b['Name'],
             AccessControlPolicy={'Owner': acl['Owner'], 'Grants': new_grants})
+        return b
