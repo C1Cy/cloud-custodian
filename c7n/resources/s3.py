@@ -186,7 +186,7 @@ def bucket_client(session, b, kms=False):
 
 
 @filters.register('global-grants')
-class NoGlobalGrants(Filter):
+class GlobalGrantsFilter(Filter):
 
     schema = type_schema('global-grants')
 
@@ -409,7 +409,7 @@ class ScanBucket(BucketActionBase):
             with open(
                     os.path.join(
                         self.manager.log_dir, 'denied.json'), 'w') as fh:
-                json.dump(fh, indent=2)
+                json.dump(self.denied_buckets, fh, indent=2)
             self.denied_buckets = []
         return results
 
@@ -742,15 +742,17 @@ class DeleteGlobalGrants(BucketActionBase):
 
     schema = type_schema(
         'delete-global-grants',
-        grantees={'type': 'array', 'items': {'type': 'string'}},
-        required=['grantees'])
+        grantees={'type': 'array', 'items': {'type': 'string'}})
 
     def process(self, buckets):
         with self.executor_factory(max_workers=5) as w:
             return filter(None, list(w.map(self.process_bucket, buckets)))
 
     def process_bucket(self, b):
-        grantees = self.data.get('grantees')
+        grantees = self.data.get(
+            'grantees', [
+                GlobalGrantsFilter.AUTH_ALL, GlobalGrantsFilter.GLOBAL_ALL])
+
         s3 = bucket_client(self.manager.session_factory(), b)
         log.info(b)
 
