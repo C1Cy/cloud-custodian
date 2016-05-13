@@ -24,13 +24,8 @@ import yaml
 from c7n.config import Config
 from c7n.credentials import SessionFactory
 from c7n.reports import report as do_report
-<<<<<<< HEAD
 from c7n.reports import report_all
-from c7n import mu, schema
-=======
 from c7n import mu, schema, policy
->>>>>>> 4d42439ffa961c331c1ba7432159c87f074c17a6
-
 
 log = logging.getLogger('custodian.commands')
 
