@@ -22,13 +22,16 @@ class Config(object):
             'config': {'type': 'string'},
             'debug': {'type': 'boolean'},
             'cache_period': {'type': 'number'},
+            'days': {'type': 'number'},
             'dryrun': {'type': 'boolean'},
+            'excel': {'type': 'string'},
             'log_group': {'type': 'string'},
             'metrics_enabled': {'type': 'boolean'},
             'output_dir': {'type': 'string'},
             'policy_names': {'type': 'array', 'items': {'type': 'string'}},
             'profile': {'type': 'string'},
             'verbose': {'type': 'boolean'},
+            'raw': {'type': 'string'},
         }
     }
 
@@ -43,10 +46,13 @@ class Config(object):
             config=options.config,
             assume_role=options.assume_role,
             profile=options.profile,
+            days=options.days,
+            excel=options.excel,
             policy_names=options.policies,
             log_group=options.log_group,
             cache_period=options.cache_period,
             metrics_enabled=getattr(options, 'metrics_enabled', None),
             output_dir=options.output_dir,
             debug=options.debug,
+            raw=options.raw,
             dryrun=getattr(options, 'dryrun', None)))
